@@ -1,0 +1,733 @@
+
+
+/*
+  Version 8.52,  13/10/18
+
+  New version stated with 
+
+  Goal for 12/10/18, final check on Cycle IRs then load and read serial responses
+
+  Rationalise switch machine and match to case switches. [    ]
+  use serial for debugging inputs. over-ride sensors and manipulate state with serial and watch responses on serial monitor.
+  25/9/18 check all time comparisons and resets in doorcycle
+
+  All changes requiring follow-up marked with **** in comments, search for ***** for things tha need follow up
+
+*/
+/* Pin use by other hardware
+  0 is hardware serial Rx keep free for serial monitor/USB
+  1 is hardware serial Tx keep free for serial monitor/USB
+  2 available  const byte IR_inPowerPin     = 2;
+  3 available const byte IR_outPowerPin     = 3;
+  4 available const byte doorSafetyPin  = 4;                    // the door safety switch pin senses the door is unobstructed and has fully closed
+****SD library ??update version maybe wants pi4 for CS ?? and would require change door safety to pin10**** Check this if any SD hassles.
+  5  available const byte SERVO_PIN      = 5;                    //Servo, attaches to    5;    //to avoid timer related resource clashes
+  6 available const byte x     = 6;                     //Digital sensor input
+  7 available const byte x    = 7;                    //Digital sensor input
+  8  const byte IC Rx     =  8;                AltSoftSerial uses pin 8
+  9 const byte IC Tx     =  9;                AltSoftSerial uses pin 9
+  10 const byte  chipSelect    = 10;             // for the data logging shield, we use digital pin 10 for the SD cs line. SD card requires pin #10 as Hardware pin
+  //new SD library prefers pin4 for CS
+  11 const int  MOSI       = 11;             These 3 are declared within the SD library so don't use these pins for anything else
+  12const int  MISO       = 12;             These 3 are declared within the SD library so don't use these pins for anything else
+  13 const int  SCK        = 13;             These 3 are declared within the SD library so don't use these pins for anything else
+  A0
+  A1
+  A5
+*/
+
+
+
+//Include libraries
+#include <Arduino.h>
+
+#include <AltSoftSerial.h>     //Faster/newer than SoftwareSerial
+#include <ServoTimer2.h>      //Chosen to avoid timer conflict in earlier version, works OK
+#include <SD.h>              // Library looks after SD card
+#include <Wire.h>           // needed for RTC communication
+#include "RTClib.h"        // Looks after clock
+
+// Settings for this box.
+//#define DEBUG_SERIAL 1 // Enable serial output
+const byte boxID = 1; // Unique box ID
+
+// Our global states the app can be in.
+#define STATE_IDLE_LISTENING_FOR_IR 0
+#define STATE_IR_IN_IS_TRIGGERED 1
+#define STATE_IR_OUT_IS_TRIGGERED 2
+#define STATE_RFID_READING 3
+#define STATE_RFID_SUCCESS 4
+#define STATE_LOG_EXIT 5
+#define STATE_DOOR_CYCLING 6
+int STATE_current = STATE_IDLE_LISTENING_FOR_IR;
+
+// Settings for RFID reader:
+//Declare the "non-hardware" serial
+AltSoftSerial RFID_serial;
+//Short Term Memory, expect OK so care if using any other comand that could give OK response
+char RFID_configureTagType[5] = {'S', 'T', '2', 13};
+// Read animal chip,   expect "String data response"
+char RFID_readTag[5] = {'R', 'A', 'T', 13,};
+// Deactivates reader circuit at setup,and end of function expect "OK" response
+char RFID_deactivateCircuit[5] = {'S', 'R', 'D', 13,};
+//Activates reader circuit, expect "OK" response
+char RFID_activateCircuit[5] = {'S', 'R', 'A', 13,};
+char RFID_currentTag[12] = {000000000000};                       //Holds the PIT ID as a char, as it comes over serial
+int RFID_currentTagPos = 0;
+
+#define RFID_STATE_OFF 1
+#define RFID_STATE_INIT 2
+#define RFID_STATE_READING 3
+#define RFID_STATE_GOT_VALUE 4
+
+int RFID_state = RFID_STATE_OFF;
+unsigned long RFID_state_time = millis();
+
+// Settings for door (servo and safety switch):
+ServoTimer2 DOOR_servo1;                             //declare the servo that will open the door
+const byte DOOR_safetyPin = 4;                    // the door safety switch pin senses the door is unobstructed and has fully closed
+const byte DOOR_servoPin = 5;                    //Servo, attaches to    5;    //to avoid timer related resource clashes
+int DOOR_isClosed = HIGH;                     // HIGH if door tightly shut
+int DOOR_servoAngleOpen = 900;                        //global to share with door cycle and training
+int DOOR_servoAngleShut = 1600;                       //global to share with door cycle and training  **COMMENT OUT IN FIELD sketch**
+
+
+#define DOOR_STATE_INITIALISE 0
+#define DOOR_STATE_OPENING 1
+#define DOOR_STATE_CLOSING 2
+#define DOOR_STATE_CHECKING 3
+#define DOOR_STATE_WAITING 4
+#define DOOR_STATE_CLOSED 5
+
+int DOOR_state = DOOR_STATE_CLOSED;
+unsigned long DOOR_state_time = millis();
+int doorTight = HIGH;
+
+// Settings for RTC:
+RTC_DS1307 RTC;                                 // define the Real Time Clock object
+
+// Settings for SD card.
+File SDCARD_logfile;                                   // this wont be the actual name of the file, a placeholder
+const byte SDCARD_chipSelectPin = 10;             // for the data logging shield, we use digital pin 10 for the SD cs line. SD card requires pin #10 as Hardware pin
+
+#define SDCARD_STATE_OFF 0
+#define SDCARD_STATE_WORKING 1
+#define SDCARD_STATE_ERROR 2
+
+int SDCARD_state = SDCARD_STATE_OFF;
+unsigned long SDCARD_state_time = millis();
+
+#define LOG_EXIT_TIME 0  
+#define FLUSH_TIME_ENTRY 1
+#define TRIGGER_DOOR 2
+
+int EXIT_Log_Door = LOG_EXIT_TIME;
+
+// Settings for IR readers:
+const byte IR_inReaderPin = 6;                   //  for inbound SharpIR
+const byte IR_outReaderPin = 7;                  // for outbound SharpIR
+const byte IR_inPowerPin = 2;                    //Switch IRs to save power, and allow settle times
+const byte IR_outPowerPin = 3;                   // Switch IRs to save power
+//int proximityInbound1 = 1;                      // made these 4 local
+//int proximityInbound2 = 1;
+//int proximityOutbound1 = 1;
+//int proximityOutbound2 = 1;                              //
+
+// cases for IR_cycle
+#define IR_INITIATE 0
+#define IR_STATE_OFF1 1                            //both off    Switch @ line 240ish
+#define IR_STATE_IN_ON_ONLY 2
+#define IR_STATE_READ_IN1 3
+#define IR_STATE_READ_IN2 4
+#define IR_STATE_OFF2 5                            //both off
+#define IR_STATE_OUT_ON_ONLY 6
+#define IR_STATE_READ_OUT1 7
+#define IR_STATE_READ_OUT2 8
+#define IR_STATE_FINISH 9
+
+int IR_state = IR_INITIATE;
+unsigned long IR_state_time = millis();
+
+
+//unsigned long IR_state_time = millis();                         //Timer variable for fnxn cycle_IR
+
+bool IR_checkStatusIn = false ;                                     // bool gets value set in 
+bool IR_checkStatusOut = false ;
+
+//Debugging serial
+int debugByte = 0;
+int deBugByte1 = HIGH;
+int deBugByte2 = HIGH;
+int deBugByte3 = HIGH;
+
+//END DEFINES ***************           END DEFINES ***************           END DEFINES ***************           END DEFINES ***************
+
+void setup() {
+  Serial.println(F("setup() - booting."));
+  Serial.begin(9600);
+  Serial.println(F("setup() - starting RFID."));
+  RFID_serial.begin(9600);
+  Serial.println(F("setup() - setting pin status."));
+
+  pinMode(DOOR_safetyPin, INPUT_PULLUP);  //4
+  pinMode(IR_inReaderPin, INPUT_PULLUP);         //6
+  pinMode(IR_outReaderPin, INPUT_PULLUP);        //7
+  pinMode(SDCARD_chipSelectPin, OUTPUT);  //10
+  pinMode(IR_inPowerPin, OUTPUT);         //2
+  pinMode(IR_outPowerPin, OUTPUT);        //3
+
+  Serial.println(F("setup() - starting SD card."));
+  if (!SD.begin(SDCARD_chipSelectPin)) {
+    Serial.println(F("setup() - warning! Couldn't connect to SD card."));
+    SDCARD_state = SDCARD_STATE_ERROR;
+  } else {
+    Serial.println(F("setup() - SD card connected.."));
+    SDCARD_state = SDCARD_STATE_WORKING;
+
+    char SDCARD_filename[] = "0BOXFL00.CSV";
+    //Adds box number to 1st place in "SDCARD_filename" will only work for 9 boxes
+    SDCARD_filename[0] = boxID + '0';
+    for (uint8_t i = 0; i < 100; i++) {
+      SDCARD_filename[6] = i / 10 + '0';
+      SDCARD_filename[7] = i % 10 + '0';
+      if (!SD.exists(SDCARD_filename)) {
+        SDCARD_logfile = SD.open(SDCARD_filename, FILE_WRITE);
+        break;
+      }
+    }
+    Serial.println(F("setup() - writing to file: "));
+    Serial.println(SDCARD_filename);
+
+    SDCARD_logfile.print("Date      Time    ");
+    SDCARD_logfile.print("     Chip#        ");
+    SDCARD_logfile.print("Outbound Proximity");
+    SDCARD_logfile.println("       Event      ");
+    delay(80);
+    SDCARD_logfile.flush();
+  }
+
+  Serial.println(F("setup() - starting RTC"));
+  Wire.begin();
+  if (!RTC.begin()) {
+    Serial.println(F("setup() - Failed to start RTC"));
+  }
+
+  Serial.println(F("setup() - Starting RFID, configuring tag, expecting OK response."));
+  RFID_serial.write(RFID_configureTagType);
+  unsigned long RFID_boot_delay = millis() + 2000;
+  while (millis() < RFID_boot_delay) {
+    for (int readByte = 0; readByte < RFID_serial.available(); readByte++) {
+      Serial.println(F("setup() - init RFID and received byte: "));
+      char bytefound = RFID_serial.read();
+      Serial.println(bytefound);
+    }
+  }
+  // RFID_serial.write (SRD);          // send code for Deactivate RF for power saving
+
+  // Set some parameters for each sensor in array
+
+  Serial.println(F("setup() - Starting IR power."));
+  digitalWrite(IR_inPowerPin, LOW);
+  digitalWrite(IR_outPowerPin, LOW);
+
+  Serial.println(F("setup() - Starting DOOR servo."));
+  DOOR_servo1.attach(DOOR_servoPin);
+  DOOR_servo1.write(DOOR_servoAngleOpen);
+  delay(500);
+  DOOR_servo1.detach();
+
+  Serial.println(F("setup() - complete"));
+}                                             // END SETUP   END SETUP  END SETUP  END SETUP  END SETUP  END SETUP  END SETUP
+
+//
+//cut to here
+
+void DOOR_trigger() {
+  switch (DOOR_state) {
+                                                                //****** redo timing variables like the IRs if they work well
+
+    case DOOR_STATE_INITIALISE:     //label 0
+Serial.println(F("Switch DOOR_state has reached case DOOR_STATE_INITIALISE"));                       //debug
+      DOOR_state = DOOR_STATE_OPENING;          //so next loop state will be DOOR_state-DOOR_STATE_OPENING
+      DOOR_state_time = millis();               // reinitialises timer after commited to case DOOR_state-DOOR_STATE_OPENING
+      DOOR_servo1.attach(DOOR_servoPin);                              // door servo has been attached,
+   
+      break;
+
+    case DOOR_STATE_OPENING:                                      //label 1
+Serial.println(F("Switch DOOR_state has reached case DOOR_STATE_OPENING"));                       //debug
+      if ( millis() > DOOR_state_time + 100) {
+        DOOR_state = DOOR_STATE_CLOSING;
+        DOOR_servo1.write(DOOR_servoAngleOpen);
+      }
+     
+      break;
+
+    case DOOR_STATE_CLOSING:                                     //label 2
+Serial.println(F("Switch DOOR_state has reached case DOOR_STATE_CLOSING"));                       //debug    
+      if ( millis() > (DOOR_state_time + 2000)) {
+        DOOR_state = DOOR_STATE_CHECKING;
+        DOOR_servo1.write(DOOR_servoAngleShut);
+      }
+      
+      break;
+
+    case DOOR_STATE_CHECKING:                                     //label 3 ******* rethink this, is a while or for loop going to be better than additional cases
+Serial.println(F("Switch DOOR_state has reached case DOOR_STATE_CHECKING"));                       //debug       
+      doorTight = digitalRead (DOOR_safetyPin);          // read door switch should be HIGH once door closed
+
+      //here we check if the safety switch is closed, if not we change to error state and repeat loop.
+      if (millis() > DOOR_state_time + 3000 && doorTight == LOW) {       // i.e. door can't shut properly
+        int var = 0;                                                      // local variable to hold digitalread door switch
+        while (var < 6 ) {                                                // cycle max of 6 times
+          DOOR_state = DOOR_STATE_INITIALISE ;                            // cycle door again to free whatever is blocking door.
+          var++;
+          Serial.print(F("DoorTight is;   "));
+          Serial.println(doorTight);
+          Serial.print(F("var =    "));
+          Serial.println(var);
+          Serial.print(F("case DOOR_STATE_CHECKING needs 3 cases to check 3x   "));
+          Serial.println(F("case _DOOR_STATE_CHECKING****Door LOW"));
+        }                                                                     // end While
+      }                                                                     // end if
+      else   if ( millis() > DOOR_state_time + 6000 && doorTight == HIGH) {                  //i.e. door is shut tight
+        DOOR_state = DOOR_STATE_WAITING;
+
+      }
+      Serial.println(F("Switch DOOR_state has reached case DOOR_STATE_CHECKING after the if and the else if part"));                       //debug 
+
+      Serial.println(F("case _DOOR_STATE_CHECKING****Door HIGH"));
+      break;
+
+    case DOOR_STATE_WAITING:                                        // label 4
+Serial.println(F("Switch DOOR_state has reached case DOOR_STATE_WAITING"));                       //debug      
+      //a delay to allow animal moving inside the box to be initially ignored for first 20 secs rather than triggering a series of door cycles
+      if (millis() > DOOR_state_time + 20000) {
+        DOOR_state = DOOR_STATE_CLOSED;                         // exit to case 5 DOOR_STATE_CLOSED
+        DOOR_servo1.detach();
+        STATE_current = STATE_IDLE_LISTENING_FOR_IR ;           // exit to next global state
+
+      }
+      break;
+    case DOOR_STATE_CLOSED:                                   //label 5   mostly in this state
+Serial.println(F("Switch DOOR_state has reached case DOOR_STATE_CLOSED"));                       //debug      
+      //  STATE_current = STATE_IDLE_LISTENING_FOR_IR;      Global state When door is closed, cycle and  monitor IRs
+      //only leaves this state when outbound IR or successful RFID active
+      //While debugging
+      if ( millis() > (DOOR_state_time + 4500) && doorTight == HIGH) { //While debugging so goes back round
+        DOOR_state = DOOR_STATE_INITIALISE;                      //While debugging goes round again after 4.5 sec
+      }
+      Serial.print(F("Report from  STATE_CYCLING_DOORS;   "));
+      Serial.println(F("case _DOOR_STATE_CLOSED"));
+      STATE_current = STATE_IDLE_LISTENING_FOR_IR;                    //next global state, doing IRs not Doors
+      break;
+
+
+  }                                             //end switch
+}                                             //end funtion
+
+void DOOR_openExit() {                                                //*****//DOOR_openExit also needs to log the exit time, best way a swich case?, 1st call  LOG_date(); , then flush, then call DOOR_trigger();
+    // see how LOG_rfidCodeFound(){  works for code.
+  Serial.println(F("DOOR_openExit() - opening door for an exit"));
+  //should it also always call LOG_rfidCodeFound
+  switch (EXIT_Log_Door){                                                   // add code to step fom 0 to 1 to 2
+    case LOG_EXIT_TIME:
+
+   break;
+
+   case FLUSH_TIME_ENTRY:
+
+   break;
+  
+  DOOR_trigger();
+}
+}
+
+
+void cycle_IRs() {                              //still good to save power even with digital sensors
+
+  switch (IR_state) {                           //times work cycle of IRs and reads appropriate times, 
+
+    case IR_INITIATE:                                                       //label 0
+    Serial.println (F("Cycle_IRs reached case IR_INITIATE    "));   
+   int proximityInbound1 ;                                                      //declare local variables for IR reads
+   int proximityInbound2 ;
+   int proximityOutbound1;
+   int proximityOutbound2 ;
+   proximityInbound1 = 1 ;                                                    //initialise local variables for IR reads
+   proximityInbound2 = 1;
+   proximityOutbound1 = 1;
+   proximityOutbound2 = 1;
+   IR_state = IR_STATE_OFF1;
+   IR_state_time = millis();                                                        //global time variable, 1st time set , subsequuent ones in case 
+
+    break;
+
+    case IR_STATE_OFF1:                                                      //label 1
+Serial.println (F("Cycle_IRs reached case IR_STATE_OFF1    "));
+      digitalWrite(IR_inPowerPin, LOW);                                 //Settling time with all sensors off
+Serial.println (F("power pins both low    "));
+      digitalWrite(IR_outPowerPin, LOW);                                //Settling time with all sensors off
+      if ( millis()> IR_state_time +100){                             //when 100ms after transition
+Serial.println (F(" millis()> IR_state_time +100 "));        
+      IR_state = IR_STATE_IN_ON_ONLY;                             //passes to next case
+    Serial.println (F("Cycle_IRs case IR_STATE_OFF1 called for transition to case IR_STATE_IN_ON_ONLY    "));
+      }
+      IR_state_time = millis();
+
+
+
+      break;
+
+    case IR_STATE_IN_ON_ONLY:                                                 //label 2
+    Serial.println (F("Cycle_IRs reached case IR_STATE_IN_ON_ONLY    "));
+      digitalWrite(IR_inPowerPin, HIGH);                                //GPIO pin enables inbound IR
+      digitalWrite(IR_outPowerPin, LOW);                                    //   outbound IR disabled
+      if (millis() > (IR_state_time + 50) ) {                              // 50ms to settle before read
+        IR_state = IR_STATE_READ_IN1;                                     //passes to next case on next loop
+      }
+      IR_state_time = millis();                                         //
+
+      break;
+
+    case IR_STATE_READ_IN1:                                                    //label3
+Serial.println (F("Cycle_IRs reached case IR_STATE_Read_In1    "));                          //Debug
+      digitalWrite(IR_inPowerPin, HIGH);                                      //GPIO pin  still enables inbound IR
+Serial.println (F("IR power pins unchanged   "));                          //Debug
+      digitalWrite(IR_outPowerPin, LOW);                                      //   outbound IR disabled
+        proximityInbound1 = digitalRead (IR_inReaderPin);     // LOW if proximity <10cm,
+Serial.println (F("Reading the inbound IR   "));                          //Debug
+Serial.print (F("millis() =      "));                         //comment out, doesn't work, uncomment, it works ????????????
+//Serial.println (millis());
+//Serial.print (F("IR_state_time =      "));
+//Serial.println (IR_state_time);
+
+
+       if (millis() > (IR_state_time + 150) ) { 
+Serial.println (F("150ms time passed   "));                          //Debug
+        IR_state = IR_STATE_READ_IN2;                                     //passes to next case at a time, not dependant on finding a LOW
+Serial.println (F("case transition called from In1 to In2   "));                          //Debug
+        }
+        IR_state_time = millis();                                         //
+
+      break;
+
+    case IR_STATE_READ_IN2:                                                    //label 4
+Serial.println (F("Cycle_IRs reached case IR_STATE_READ_IN2    "));                          //Debug
+      digitalWrite(IR_inPowerPin, HIGH);                                      //GPIO pin  still enables inbound IR
+      digitalWrite(IR_outPowerPin, LOW);                                      //   outbound IR disabled
+
+      if (millis() > (IR_state_time + 50) ) {                                    //50ms after first read
+        proximityInbound2 = digitalRead (IR_inReaderPin);             // LOW if proximity <10cm
+Serial.print (F("re-readiing IR_inReaderPin   "));        //Debug        
+      }
+Serial.print (F("Current values for Proximity inbound1 and inbound 2 is :   "));        //Debug
+       // Serial.println (F("***********$$$$$$$$$$Inserting deBugByte1 here (x2) $$$$$$$$$$$$$$************  "));                          //Debug
+       // proximityInbound1 = deBugByte1;                       //debug from serial
+       // proximityInbound2 = deBugByte1;                       //debug from serial
+Serial.print (proximityInbound1);                          //Debug
+Serial.print (F("    "));                                //Debug
+Serial.println (proximityInbound2);                           //Debug
+
+
+      if (proximityInbound1 == 0 && proximityInbound2 == 0 ) {
+        IR_checkStatusIn = true;                                                    //Bool
+Serial.print (F("IR_checkStatusIn just changed to true "));                                           //Debug
+        STATE_current = STATE_IR_IN_IS_TRIGGERED;           //this transitions without condition to State RFID reading which calls RFID_checkForTag();
+Serial.println(F("State transition requested, IDLE_LISTENING_FOR_IR -> IR_IN_IS_TRIGGERED"));                          //Debug
+      }
+        else if (millis() > (IR_state_time + 150) ) {
+        STATE_current = IR_STATE_OFF2;
+        IR_state_time = millis();
+      }
+
+      break;
+
+    case IR_STATE_OFF2:                                                     //label 5
+    Serial.println (F("Cycle_IRs reached case IR_STATE_OFF2    "));                          //Debug
+        digitalWrite(IR_inPowerPin, LOW);                           //Both sensors disabled, no overlap, settling time between disable and next enable & read
+        digitalWrite(IR_outPowerPin, LOW);
+      if (millis() > (IR_state_time + 100)) {
+        IR_state = IR_STATE_OUT_ON_ONLY;                            //passes to next case
+        IR_state_time = millis();
+
+      }
+
+      break;
+
+    case IR_STATE_OUT_ON_ONLY:                                                //label 6
+      Serial.println (F("Cycle_IRs reached case IR_STATE_OUT_ON_ONLY    "));                          //Debug
+        digitalWrite(IR_inPowerPin, LOW);                                 //Inbound pin disables IR sensor
+        digitalWrite(IR_outPowerPin, HIGH);                               //Outbound pin enables IR sensor
+      if (millis() > (IR_state_time + 100) ) {
+        IR_state = IR_STATE_READ_OUT1;                                   //passes to next case        
+      }
+      IR_state_time = millis();
+
+      break;
+
+    case IR_STATE_READ_OUT1:                                                    //label 7
+    Serial.println (F("Cycle_IRs reached case IR_STATE_READ_OUT1    "));                          //Debug
+      digitalWrite(IR_inPowerPin, LOW);
+      digitalWrite(IR_outPowerPin, HIGH);
+      if (millis() > (IR_state_time + 50) ) {                                  //50ms after enable
+        proximityOutbound1 = digitalRead (IR_outReaderPin);                 // reads each loop till
+      }
+      if (millis() > (IR_state_time + 150) ) {
+      IR_state = IR_STATE_READ_OUT2;                                     //passes to next case and cuts off reading
+      }
+      IR_state_time = millis();
+
+      break;
+
+    case IR_STATE_READ_OUT2:                                                    //label 8
+    Serial.println (F("Cycle_IRs reached case IR_STATE_READ_OUT2    "));                          //Debug
+      digitalWrite(IR_inPowerPin, LOW);
+      digitalWrite(IR_outPowerPin, HIGH);
+
+      if (millis() > (IR_state_time + 50) ) {                             //     50ms after first read
+        proximityOutbound2 = digitalRead (IR_outReaderPin);                 //  read again
+      }
+        Serial.print (F("Report from IR_STATE_Read_Out2 "));                          //Debug block 4 lines
+        Serial.print (proximityOutbound1);
+        Serial.print (F("    "));
+        Serial.println (proximityOutbound2);
+
+
+      if (proximityOutbound1 == 0 &&  proximityOutbound2 == 0) {
+        IR_checkStatusOut = true;
+        Serial.print (F("IR_checkStatusOut just changed to true "));
+        STATE_current = STATE_IR_OUT_IS_TRIGGERED;                           //State transition because of confirmed proximity, cuts off this switch
+        Serial.print (F("IR_STATE_Outbound confirmed Log/Door called  "));
+      }
+
+      else if (millis() > (IR_state_time + 150) ) {
+        IR_state = IR_INITIATE;                                      //Case transition because of time, restarts switch case 
+      }
+
+      break;
+
+
+    }   //end switch
+  }   //end fnxn
+
+
+
+
+
+void LOG_date() {                   //Logs date,time to SD card
+  Serial.println(F("LOG_date() - Logging date to SD card"));
+  DateTime now = RTC.now();                               // fetch the time, time won't increment without this
+  SDCARD_logfile.print("Date");
+  SDCARD_logfile.print("");
+  SDCARD_logfile.print('"');
+  SDCARD_logfile.print(now.day(), DEC);
+  SDCARD_logfile.print("/");
+  SDCARD_logfile.print(now.month(), DEC);
+  SDCARD_logfile.print("/");
+  SDCARD_logfile.print(now.year(), DEC);
+  SDCARD_logfile.print('"');
+  SDCARD_logfile.print(",");
+  SDCARD_logfile.print("Time");
+  SDCARD_logfile.print("");
+  SDCARD_logfile.print(now.hour(), DEC);
+  SDCARD_logfile.print(":");
+  SDCARD_logfile.print(now.minute(), DEC);
+  SDCARD_logfile.print(":");
+  SDCARD_logfile.print(now.second(), DEC);         //Excell is chopping off the seconds in cells but notepad and the excel formula bar show correctly.Excel's problem not Arduino
+  SDCARD_logfile.print('"');
+  SDCARD_logfile.print(" ");
+}
+
+//if go for the idea of opporrtunist scan as leaving, will need a direction variable and log it here
+
+void LOG_rfidCodeFound() {
+  Serial.println(F("LOG_codeFound() - running"));
+  LOG_date();                                 //  makes time stamp into line of data for SD
+  SDCARD_logfile.print(RFID_currentTag);
+  SDCARD_logfile.flush();                //Saves line to current file
+
+}
+
+void RFID_checkForTag() {                                                                       //Try as void instead of bool can this whole thing go above fnxn cycle_IRs()
+  switch (RFID_state) {
+    case RFID_STATE_OFF:
+      Serial.println(F("RFID_checkForTag() - Starting RFID"));
+      RFID_serial.write(RFID_activateCircuit);
+      RFID_state = RFID_STATE_INIT;
+      RFID_state_time = millis();
+      break;
+
+    case RFID_STATE_INIT:
+      // we're initializing the card, wait here for at least 200 milliseconds while it starts.
+      if ( millis() > RFID_state_time + 200 ) {                         // time for RFID reader to reboot and read
+        Serial.println(F("RFID_checkForTag() - RFID has waited 200, changing into read state"));
+        RFID_state = RFID_STATE_READING;
+      }
+      break;
+
+    case RFID_STATE_READING:
+      // Ready to read a tag.
+      for (int readByte = 0; readByte < RFID_serial.available(); readByte++) {                      //sequentially read bytes coming in from RFID
+        Serial.println(F("RFID_checkForTag() - read a byte:"));
+        char bytefound = RFID_serial.read();
+        Serial.println(bytefound);
+        if (bytefound == '_') {                                           //If there is an underscore
+          RFID_currentTagPos = 0;                                         //make that position 0 in an array called RFID_currentTag
+        } else {
+          if (RFID_currentTagPos < 12) {                                  //    if the 12 spaces in the array are not yet full
+            RFID_currentTag[RFID_currentTagPos ++] = bytefound;           // add bytefound into the next space in RFID_currentTagPos
+          }
+          if (RFID_currentTagPos == 12) {                                 //if the 12 spaces are full
+            RFID_state = RFID_STATE_GOT_VALUE;                            // move to nextcase
+            RFID_state_time = millis();                                   // reset timer variable
+          }
+        }
+      }
+      break;
+
+    case RFID_STATE_GOT_VALUE:
+      // we have a tag value in RFID_currentTag
+      Serial.println(F("RFID_checkForTag() - found a code:"));            // print code found
+      Serial.println(RFID_currentTag);
+
+      long RFID_currentTagNumber = atol(RFID_currentTag);                 //Convert the char to a long int
+      switch (RFID_currentTagNumber) {                                    //switch case within case "RFID_STATE_GOT_VALUE" which then continues
+        case 141000981547:
+        case 141000981549:
+        case 141000981545:
+        case 141000981542:
+          Serial.println(F("RFID_checkForTag() - access granted."));      //in this switch case if chip doesn't match it falls thru to next case = chip#
+          LOG_rfidCodeFound();                                            //Action is the same as long as chip number is one of the list
+          STATE_current = STATE_RFID_SUCCESS;                             //Change to next case in switch machine, door cycle gets called
+          break;
+        default:
+          Serial.println(F("RFID_checkForTag() - access DENIED."));       // default action, call access denied and don't call door cycle
+      }                                                                       //just end of switch RFID_currentTagNumber within case RFID_STATE_GOT_VALUE: of RFID_state
+
+      Serial.println(F("RFID_checkForTag() - Stopping RFID reader"));         //conclusion of case RFID_STATE_GOT_VALUE:
+      RFID_serial.write(RFID_deactivateCircuit);
+      RFID_state = RFID_STATE_OFF;
+      RFID_state_time = millis();
+      RFID_currentTag[12] = 0;                                                //resets the char RFID_currentTag to 0
+      RFID_currentTagPos = 0;                                                 //and the next wrrite position to 0
+
+      break;
+  }                                                                           // end switch (RFID_state) {
+}                                                                               // end Bool RFID_checkForTag {
+
+
+
+void loop() {
+  // Not sure this is needed in every loop: ?         ****When everything else works, comment it out****
+  DateTime now;
+
+  if (Serial.available() > 0) {
+    int debugByte = Serial.read();
+    //use serial for debugging inputs.
+    // do something different depending on the character received.
+    // The switch statement expects single number values for each case; in this
+    // example, though, you're using single quotes to tell the controller to get
+    // the ASCII value for the character. For example 'a' = 97, 'b' = 98,
+    // and so forth:
+
+    switch (debugByte) {
+      case 'a':                                 //97
+        deBugByte1 = LOW;                   //mimic inputs from sensors, 1st read
+        break;
+      case 'b':                             //98
+        deBugByte2 = LOW;                   // 2nd read
+        break;
+      case 'c':
+        deBugByte3 = LOW ;                  // door switch
+        break;
+      case 'd':                               // All back to HIGH default state
+        deBugByte1 = HIGH;
+        deBugByte2 = HIGH;
+        deBugByte3 = HIGH;
+        break;
+
+
+      /*
+        Use these above by writing *variable = deBugByte* ; in line following a digital read before variable is assigned
+
+        Options for STATE_current****
+        STATE_IDLE_LISTENING_FOR_IR 0
+        STATE_IR_IN_IS_TRIGGERED 1
+        STATE_IR_OUT_IS_TRIGGERED 2
+        STATE_RFID_READING 3
+        STATE_RFID_SUCCESS 4
+        STATE_DOOR_CYCLING 5        */
+
+      case 'e':
+        STATE_current = STATE_IDLE_LISTENING_FOR_IR;      //mimics statements to force state change, (enters named state)
+        break;
+
+      default:
+        Serial.println (F( "Debug serial insertion failed    "));
+    }
+  }
+
+
+  switch (STATE_current) {
+    case STATE_IDLE_LISTENING_FOR_IR:                                           // label 0                                                                 
+     cycle_IRs();                                                               //function that times work cycle of IRs and reads appropriate times called every loop if this state current
+      Serial.println(F("STATE_current is STATE_IDLE_LISTENING_FOR_IR"));
+
+
+     //  if (IR_checkStatusOut == true) {                                              //these 3 lines handled in fnxn cycle IRs case read out 2
+      //  STATE_current = STATE_IR_OUT_IS_TRIGGERED;                          // jump to case  "STATE_IR_OUT_IS_TRIGGERED: "
+      //  Serial.println(F("State transition, IDLE_LISTENING_FOR_IR -> IR_IN_IS_TRIGGERED"));
+     
+      break;
+
+    case STATE_IR_IN_IS_TRIGGERED:                                          //label 1
+      Serial.println(F("STATE_current is StateIRinIsTriggered"));
+      Serial.println(F("loop() - IR IN has triggered, turning on RFID"));               // in is triggered, we want to turn the rfid on.
+      STATE_current = STATE_RFID_READING;                                               // which in turn calls fnxn RFID_checkForTag()
+
+      break;
+
+    case STATE_IR_OUT_IS_TRIGGERED:                                         //label 2
+      Serial.println(F("loop() - IR OUT has triggered"));
+      Serial.println(F("STATE_current is StateIR_OutIsTriggered"));
+      STATE_current = STATE_LOG_EXIT;
+      //****What about the log here
+      DOOR_openExit();                                        //then log time of exit
+
+      // add this feature once everything works if still feel the need
+      //scan after interval for door to open then log time, direction and chip# regardless if on list.
+
+      
+      break;
+
+    case STATE_RFID_READING:                                                 //label 3
+      //  Serial.println(F("loop() - RFID is reading"));
+      Serial.println(F("STATE_current is RFID_Is_Reading"));
+      RFID_checkForTag();
+
+      break;
+
+
+    case STATE_RFID_SUCCESS:                                                //label 4
+      Serial.println(F("loop() - RFID received successfully"));
+      Serial.println(F("STATE_current is State_RFID_Success"));
+      DOOR_trigger();
+
+      break;
+
+    case STATE_LOG_EXIT:                                                      // label 5
+    Serial.println(F("STATE_current is STATE_DOOR_CYCLING"));                     //
+    
+
+      break;
+
+    case STATE_DOOR_CYCLING:                                                  // label 6    
+
+      Serial.println(F("STATE_current is STATE_DOOR_CYCLING"));                     //transitions with statement in fnxn DOOR-trigger case DOOR_STATE_CLOSED
+
+      
+
+      break;
+}                 // end switch
+}                   // end loop
